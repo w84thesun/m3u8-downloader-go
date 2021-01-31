@@ -1,4 +1,4 @@
-module m3u8-Downloader-Go
+module m3u8-downloader-go
 
 go 1.12
 

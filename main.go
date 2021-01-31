@@ -2,14 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"m3u8-Downloader-Go/decrypter"
-	"m3u8-Downloader-Go/joiner"
-	"m3u8-Downloader-Go/zhttp"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -20,11 +18,14 @@ import (
 	"github.com/grafov/m3u8"
 	"github.com/greyh4t/hackpool"
 	"github.com/guonaihong/clop"
+
+	"m3u8-downloader-go/decrypter"
+	"m3u8-downloader-go/joiner"
+	"m3u8-downloader-go/zhttp"
 )
 
 var (
 	ZHTTP        *zhttp.Zhttp
-	JOINER       *joiner.Joiner
 	conf         *Conf
 	keyCache     = map[string][]byte{}
 	keyCacheLock sync.Mutex
@@ -40,10 +41,11 @@ type Conf struct {
 	Timeout   time.Duration `clop:"-t; --timeout" usage:"timeout" default:"30s"`
 	Proxy     string        `clop:"-p; --proxy" usage:"proxy. Example: http://127.0.0.1:8080"`
 	Headers   []string      `clop:"-H; --header; greedy" usage:"http header. Example: Referer:http://www.example.com"`
+	InFile    string        `clop:"-i; --in-file" usage:"input file with URLs"`
 	headers   map[string]string
 }
 
-func init() {
+func main() {
 	conf = &Conf{}
 	clop.CommandLine.SetExit(true)
 	clop.Bind(&conf)
@@ -62,10 +64,110 @@ func init() {
 			}
 		}
 	}
+
+	var err error
+	ZHTTP, err = zhttp.New(conf.Timeout, conf.Proxy)
+	if err != nil {
+		log.Fatalln("[-] Init failed:", err)
+	}
+
+	if conf.InFile != "" {
+		m3u8Files, err := processInFile(conf.InFile)
+		if err != nil {
+			log.Fatalln("[-] Failed to process input file:", err)
+		}
+
+		for name, mediaURL := range m3u8Files {
+			m3u8File, err := downloadM3u8(mediaURL)
+			if err != nil {
+				log.Fatalln("[-] Download m3u8 file failed:", err)
+			}
+
+			mpl, err := parseM3u8(m3u8File)
+			if err != nil {
+				log.Fatalln("[-] Parse m3u8 file failed:", err)
+			} else {
+				log.Println("[+] Parse m3u8 file succeed")
+			}
+
+			downloadFile(mpl, name)
+		}
+
+		return
+	}
+
+	var m3u8File []byte
+	if conf.File != "" {
+		m3u8File, err = ioutil.ReadFile(conf.File)
+		if err != nil {
+			log.Fatalln("[-] Load m3u8 file failed:", err)
+		}
+	} else {
+		m3u8File, err = downloadM3u8(conf.URL)
+		if err != nil {
+			log.Fatalln("[-] Download m3u8 file failed:", err)
+		}
+	}
+
+	mpl, err := parseM3u8(m3u8File)
+	if err != nil {
+		log.Fatalln("[-] Parse m3u8 file failed:", err)
+	} else {
+		log.Println("[+] Parse m3u8 file succeed")
+	}
+
+	outFile := conf.OutFile
+	if outFile == "" {
+		outFile = filename(mpl.Segments[0].URI)
+
+	}
+
+	downloadFile(mpl, outFile)
+}
+
+func processInFile(file string) (map[string]string, error) {
+	inFile, err := ioutil.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	csvFile := csv.NewReader(bytes.NewReader(inFile))
+
+	records, err := csvFile.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	urls := make(map[string]string)
+	for _, record := range records {
+		urls[record[0]] = record[1]
+	}
+
+	return urls, nil
+}
+
+func downloadFile(mpl *m3u8.MediaPlaylist, outFile string) {
+	joiner, err := joiner.New(outFile)
+	if err != nil {
+		log.Fatalln("[-] Open file failed:", err)
+	} else {
+		log.Println("[+] Will save to", joiner.Name())
+	}
+
+	if mpl.Count() > 0 {
+		log.Println("[+] Total", mpl.Count(), "files to download")
+
+		start(joiner, mpl)
+
+		err = joiner.Run(int(mpl.Count()))
+		if err != nil {
+			log.Fatalln("[-] Write to file failed:", err)
+		}
+		log.Println("[+] Download succeed, saved to", joiner.Name())
+	}
 }
 
 func checkConf() {
-	if conf.URL == "" && conf.File == "" {
+	if conf.URL == "" && conf.File == "" && conf.InFile == "" {
 		fmt.Println("You must set the -u or -f parameter")
 		clop.Usage()
 	}
@@ -83,13 +185,13 @@ func checkConf() {
 	}
 }
 
-func start(mpl *m3u8.MediaPlaylist) {
+func start(joiner *joiner.Joiner, mpl *m3u8.MediaPlaylist) {
 	pool := hackpool.New(conf.ThreadNum, download)
 
 	go func() {
 		var count = int(mpl.Count())
 		for i := 0; i < count; i++ {
-			pool.Push(i, mpl.Segments[i], mpl.Key)
+			pool.Push(i, mpl.Segments[i], mpl.Key, joiner)
 		}
 		pool.CloseQueue()
 	}()
@@ -159,7 +261,7 @@ func parseM3u8(data []byte) (*m3u8.MediaPlaylist, error) {
 		return mpl, nil
 	}
 
-	return nil, errors.New("unsupport m3u8 type")
+	return nil, errors.New("unsupported m3u8 type")
 }
 
 func getKey(url string) ([]byte, error) {
@@ -189,6 +291,7 @@ func download(args ...interface{}) {
 	id := args[0].(int)
 	segment := args[1].(*m3u8.MediaSegment)
 	globalKey := args[2].(*m3u8.Key)
+	joiner := args[3].(*joiner.Joiner)
 
 	statusCode, data, err := ZHTTP.Get(segment.URI, headers, conf.Retry)
 	if err != nil {
@@ -230,9 +333,9 @@ func download(args ...interface{}) {
 		}
 	}
 
-	log.Println("[+] Download succed:", id, segment.URI)
+	log.Println("[+] Download succeed:", id, segment.URI)
 
-	JOINER.Join(id, data)
+	joiner.Join(id, data)
 }
 
 func formatURI(base *url.URL, u string) (string, error) {
@@ -256,58 +359,4 @@ func filename(u string) string {
 	obj, _ := url.Parse(u)
 	_, filename := filepath.Split(obj.Path)
 	return filename
-}
-
-func main() {
-	var err error
-	ZHTTP, err = zhttp.New(conf.Timeout, conf.Proxy)
-	if err != nil {
-		log.Fatalln("[-] Init failed:", err)
-	}
-
-	t := time.Now()
-
-	var data []byte
-	if conf.File != "" {
-		data, err = ioutil.ReadFile(conf.File)
-		if err != nil {
-			log.Fatalln("[-] Load m3u8 file failed:", err)
-		}
-	} else {
-		data, err = downloadM3u8(conf.URL)
-		if err != nil {
-			log.Fatalln("[-] Download m3u8 file failed:", err)
-		}
-	}
-
-	mpl, err := parseM3u8(data)
-	if err != nil {
-		log.Fatalln("[-] Parse m3u8 file failed:", err)
-	} else {
-		log.Println("[+] Parse m3u8 file succed")
-	}
-
-	outFile := conf.OutFile
-	if outFile == "" {
-		outFile = filename(mpl.Segments[0].URI)
-	}
-
-	JOINER, err = joiner.New(outFile)
-	if err != nil {
-		log.Fatalln("[-] Open file failed:", err)
-	} else {
-		log.Println("[+] Will save to", JOINER.Name())
-	}
-
-	if mpl.Count() > 0 {
-		log.Println("[+] Total", mpl.Count(), "files to download")
-
-		start(mpl)
-
-		err = JOINER.Run(int(mpl.Count()))
-		if err != nil {
-			log.Fatalln("[-] Write to file failed:", err)
-		}
-		log.Println("[+] Download succed, saved to", JOINER.Name(), "cost:", time.Now().Sub(t))
-	}
 }
